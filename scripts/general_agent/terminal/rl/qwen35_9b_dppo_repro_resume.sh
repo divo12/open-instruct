@@ -1,57 +1,29 @@
 #!/bin/bash
 
-# OPD shape test: 256 unique prompts x 1 sample (vs the baseline's 8 x 32).
-#
-# Pure OPD needs no group baseline (the advantage is per-token reverse KL), so
-# RL-style group sampling only reduces per-step prompt diversity: 32 rollouts
-# of one prompt produce highly correlated teacher corrections, making each
-# gradient step effectively an average over 8 tasks. This run maximizes
-# per-step decorrelation at the same 256 rollouts/step. References: Thinking
-# Machines OPD uses 64x4; GKD uses ~Nx1. Compare directly against the 8x32
-# arm (best TB2.1 0.202, KL floor ~0.095, eval band +-0.04 at lr 1e-6):
-#   * KL trajectory steepness + floor level (optimization vs capacity)
-#   * eval oscillation band (gradient noise hypothesis for the lr sensitivity)
-#
-# n=1 notes: env advantages degenerate to exactly 0 under centered
-# normalization (fine: --opd_pure discards them; val/advantages_* logging 0 is
-# EXPECTED, gradient flows from the OPD term — validated locally 2026-08-20,
-# 16x1 on Qwen3-0.6B<-1.7B: 4/4 steps, no NaN, grad_norm ~24). This shape is
-# NOT valid for the +reward variant. Watch podman churn: ~256 unique task
-# images/step instead of ~8 (shared base layers + aus-208 mirror should absorb
-# it) — if bash/failure_rate or reset timings degrade, fall back to 64x4.
-#
-# Student/teacher identical to the 8x32 baseline and the maskreason arm:
-# hamishivi/Qwen3.5-4B <- allenai/tmax-9b, lr 1e-6, pure OPD, 64k, 4 nodes.
-# Workspace: ai2/oe-agents.
+# RESUME of the 8-node DPPO 9B repro (qwen35_9b_dppo_repro.sh) which exhausted its
+# max_retries (5) after repeated preemptions/OOMs on oe-agents at ~step 236.
+# Pins --checkpoint_state_dir to the original run's state dir so grpo_fast resumes
+# from the latest saved global_step (mason respects an explicit /weka path). Same
+# recipe/parallelism (8 nodes, 16 learners SP=4, 48 engines) as required for resume.
 
 BEAKER_IMAGE="${1:?Usage: $0 <beaker-image>}"
 
-MODEL=hamishivi/Qwen3.5-4B
-TOKENIZER=hamishivi/Qwen3.5-4B
-TEACHER_MODEL=allenai/tmax-27b
+MODEL=hamishivi/Qwen3.5-9B
+TOKENIZER=hamishivi/Qwen3.5-9B
 
-EXP_NAME=swerl_qwen35_4b_opd_from_tmax27b_256x1_4node_64k
-
-# Resume support: pass OPD_RESUME_STATE_DIR=<state dir> to continue from saved
-# ZeRO state after Beaker exhausts --max_retries (mason leaves a caller-supplied
-# /weka checkpoint_state_dir alone instead of stamping a fresh one).
-RESUME_ARGS=()
-RESUME_NOTE=""
-if [[ -n "${OPD_RESUME_STATE_DIR:-}" ]]; then
-    RESUME_ARGS=(--checkpoint_state_dir "$OPD_RESUME_STATE_DIR")
-    RESUME_STEP=$(cat "$OPD_RESUME_STATE_DIR/latest" 2>/dev/null || echo unknown)
-    RESUME_NOTE=" [resumed from $RESUME_STEP]"
-fi
+EXP_NAME=swerl_qwen35_9b_dppo_repro
+# Original run's auto-assigned state dir (has global_step233/223/213 + latest).
+CHECKPOINT_STATE_DIR=/weka/oe-adapt-default/allennlp/deletable_checkpoint_states/shashankg/1783921282_244270
 
 uv run python mason.py \
        --cluster ai2/jupiter \
        --image "$BEAKER_IMAGE" \
-       --description "OPD: base Qwen3.5-4B student <- tmax-27b teacher, 256x1 shape (6.75x gap; pure distill; 4-node; 64k)${RESUME_NOTE}" \
+       --description "tmax-15k DPPO Qwen35 9b (repro; RESUME from ~step 236)" \
        --pure_docker_mode \
        --workspace ai2/oe-agents \
        --priority urgent \
        --preemptible \
-       --num_nodes 4 \
+       --num_nodes 8 \
        --max_retries 5 \
        --env REPO_PATH=/stage \
        --env BEAKER_ALLOW_SUBCONTAINERS=1 \
@@ -72,7 +44,7 @@ uv run python mason.py \
        --env SWERL_PODMAN_IMAGE_JANITOR_ENABLED=1 \
        --env SWERL_PODMAN_IMAGE_JANITOR_INTERVAL_S=60 \
        --env SWERL_PODMAN_IMAGE_JANITOR_UNTIL=10m \
-       --env MIRROR_URL=jupiter-cs-aus-140.reviz.ai2.in:5000 \
+       --env MIRROR_URL=jupiter-cs-aus-137.reviz.ai2.in:5000 \
        --env PODMAN_NUM_LOCKS=65536 \
        --env CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
        --secret DOCKER_PAT=shashankg_DOCKER_PAT \
@@ -86,15 +58,11 @@ uv run python mason.py \
     --response_length 65536 \
     --pack_length 67584 \
     --per_device_train_batch_size 1 \
-    --num_unique_prompts_rollout 256 \
-    --num_samples_per_prompt_rollout 1 \
+    --num_unique_prompts_rollout 8 \
+    --num_samples_per_prompt_rollout 32 \
     --async_steps 4 \
     --model_name_or_path $MODEL \
     --tokenizer_name_or_path $TOKENIZER \
-    --opd_teacher_model_name_or_path $TEACHER_MODEL \
-    --opd_kl_coef 1.0 \
-    --opd_pure \
-    --filter_zero_std_samples false \
     --temperature 1.0 \
     --learning_rate 1e-6 \
     --total_episodes 128000 \
@@ -103,7 +71,7 @@ uv run python mason.py \
     --sequence_parallel_size 4 \
     --num_epochs 1 \
     --num_learners_per_node 8 8 \
-    --vllm_num_engines 16 \
+    --vllm_num_engines 48 \
     --vllm_tensor_parallel_size 1 \
     --beta 0.0 \
     --use_vllm_logprobs true \
@@ -115,7 +83,7 @@ uv run python mason.py \
     --with_tracking \
     --wandb_project oe-general-agents \
     --save_traces \
-    --save_trainer_logprobs false \
+    --save_trainer_logprobs true \
     --tools swerl_vanillux_sandbox \
     --tool_configs '{"task_data_hf_repo": "allenai/tmax-15k-open-instruct", "test_timeout": 120, "image": "python:3.12-slim"}' \
     --pool_size 512 \
@@ -123,9 +91,11 @@ uv run python mason.py \
     --verification_reward 1.0 \
     --tool_parser_type vllm_qwen3_xml \
     --system_prompt_override_file scripts/train/debug/envs/swerl_vanillux_sandbox_system_prompt.txt \
+    --active_sampling \
     --backend_timeout 1200 \
     --vllm_gdn_prefill_backend triton \
     --checkpoint_state_freq 10 \
+    --checkpoint_state_dir "$CHECKPOINT_STATE_DIR" \
     --inflight_updates true \
     --lm_head_fp32 true \
     --use_liger_grpo_loss \
@@ -139,5 +109,4 @@ uv run python mason.py \
     --exp_name $EXP_NAME \
     --local_eval_every 10 \
     --save_freq 20 \
-    --try_launch_beaker_eval_jobs_on_weka False \
-    "${RESUME_ARGS[@]}"
+    --try_launch_beaker_eval_jobs_on_weka False

@@ -46,6 +46,7 @@ uv run python mason.py \
     --weight_decay 0.0 \
     --num_train_epochs 2 \
     --dataset_mixer_list $DATASET 1.0 \
+    --dataset_config_hash f1be244349 \
     --gradient_checkpointing \
     --checkpointing_steps epoch \
     --clean_checkpoints_at_end false \
